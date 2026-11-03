@@ -28,6 +28,7 @@ from model_processors import (
     process_untrainable,
     rmse_bins_exploit,
 )
+from models.fsrs_xgboost import xgboost_predict
 from models.model_factory import create_model
 from models.trainable import TrainableModel
 from utils import (
@@ -446,6 +447,7 @@ def process(user_id: int, device_id: int | None = None) -> tuple[dict, str | Non
     # Process trainable models
     use_double_fallback = _is_deck_or_preset_partition_mode()
     w_list = []
+    trainsets = []
     testsets = []
     tscv = TimeSeriesSplit(n_splits=config.n_splits)
     for split_i, (train_index, test_index) in enumerate(tscv.split(dataset)):
@@ -468,6 +470,7 @@ def process(user_id: int, device_id: int | None = None) -> tuple[dict, str | Non
         if config.no_train_same_day:
             train_set = train_set[train_set["elapsed_days"] > 0].copy()
 
+        trainsets.append(train_set)
         testsets.append(test_set)
 
         # User-level fallback (per split), only for deck/preset partitioning
@@ -541,6 +544,22 @@ def process(user_id: int, device_id: int | None = None) -> tuple[dict, str | Non
     y = []
     save_tmp = []
     model: Any = None
+
+    if config.xgboost:
+        # FSRS-XGBoost: the same per-fold base-model fits, then a walk-forward XGBoost
+        # residual on their logits (models/fsrs_xgboost.py).
+        save_tmp = xgboost_predict(
+            dataset,
+            w_list,
+            trainsets,
+            testsets,
+            config,
+            fit_weights=lambda df: _fit_trainable_weights(_apply_recency_weighting(df)),
+        )
+        for partition_testset in save_tmp:
+            p.extend(partition_testset["p"].tolist())
+            y.extend(partition_testset["y"].tolist())
+        testsets = []  # predictions done: skip the batch prediction below
 
     for i, (w, testset) in enumerate(zip(w_list, testsets)):
         for partition in testset["partition"].unique():

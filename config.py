@@ -1,4 +1,5 @@
 import argparse
+import json
 import re
 from pathlib import Path
 from typing import Literal, Optional, get_args
@@ -84,6 +85,17 @@ def create_parser():
         default=False,
         action="store_true",
         help="Enable FSRS-7 scheduling penalties (penalty 1 & 2). L2 penalty is always on. (default: False)",
+    )
+    parser.add_argument(
+        "--xgboost",
+        choices=["per-user", "global"],
+        default=None,
+        help="FSRS-XGBoost: add an XGBoost logit residual on top of the base FSRS model (models/fsrs_xgboost.py). per-user fits one booster per user and fold; global loads pretrained boosters from --xgboost_boosters. (default: off)",
+    )
+    parser.add_argument(
+        "--xgboost_boosters",
+        default=None,
+        help="directory with pretrained global boosters (global_boosters_meta.json + fold_*.ubj) for --xgboost global",
     )
     parser.add_argument(
         "--compile",
@@ -220,6 +232,20 @@ class Config:
         self.two_buttons: bool = args.two_buttons
         self.only_S0: bool = args.S0
         self.sched_penalties: bool = args.sched_penalties  # only for FSRS-7
+        self.xgboost: str | None = args.xgboost
+        self.xgboost_boosters: str | None = args.xgboost_boosters
+        if self.xgboost == "global" and not self.xgboost_boosters:
+            raise ValueError("--xgboost global requires --xgboost_boosters")
+        if self.xgboost == "global":
+            # Fail before any user runs if the boosters belong to another base model.
+            meta_file = Path(self.xgboost_boosters) / "global_boosters_meta.json"
+            trained_for = json.loads(meta_file.read_text(encoding="utf-8")).get(
+                "baseModel", "FSRS-7"
+            )
+            if trained_for != args.algo:
+                raise ValueError(
+                    f"--xgboost_boosters were trained for {trained_for}, not {args.algo}"
+                )
         self.use_compile: bool = (
             args.compile
         )  # torch.compile FSRS-7 forward (FSRS-7 only)
@@ -282,6 +308,10 @@ class Config:
             _file_name_parts.append("-S0")
         if self.sched_penalties:
             _file_name_parts.append("-sched_penalties")
+        if self.xgboost == "per-user":
+            _file_name_parts.append("-xgboost")
+        elif self.xgboost == "global":
+            _file_name_parts.append("-xgboost_global")
         if self.two_buttons:
             # Suffix is '-binary' for backward compatibility with existing analysis scripts.
             _file_name_parts.append("-binary")

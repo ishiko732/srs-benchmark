@@ -21,6 +21,7 @@ dependencies = [
     "fsrs-rs-python>=0.8.2",
     "psutil>=7.2.2",
     "relplot>=1.0.3",
+    "xgboost>=3.4.1",
 ]
 
 [tool.uv.sources]
