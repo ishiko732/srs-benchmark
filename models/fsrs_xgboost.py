@@ -22,8 +22,13 @@ short-term stability and two curve components) are NaN, which XGBoost routes nat
 
 Scopes:
 - per-user: one booster per user and fold, trained on that user's train split.
-- global: boosters pretrained across users (one per fold index) and loaded from
-  --xgboost_boosters; the meta file names the base model they were trained for.
+- global: one booster per fold index, pooled over --xgboost_anchors users picked evenly
+  along the user-size order (each user weighs the same, at most 15,000 recent rows per
+  fold). They are trained into --xgboost_boosters on the first run and reused after
+  that; the meta file records the base model and prior they belong to.
+
+    python script.py --algo FSRS-7 --xgboost global --xgboost_boosters boosters/fsrs7 \
+        --short --secs --recency
 
 Like the base model, this is a prediction made at review time from the review history.
 """
@@ -927,21 +932,38 @@ def predict_calibrated_prob(
 
 
 # --------------------------------------------------------------------------------------
-# Walk-forward orchestration (called from script.process after the base-model fold fits)
+# Walk-forward orchestration (called from script.py after the base-model fold fits)
 # --------------------------------------------------------------------------------------
 
 GLOBAL_META_FILE = "global_boosters_meta.json"
-_GLOBAL_CACHE: dict[str, tuple[dict[str, Any], dict[int, FittedBooster]]] = {}
+_GLOBAL_CACHE: dict[str, dict[int, FittedBooster]] = {}
 
 
-def load_global_boosters(
-    boosters_dir: str | Path, model_name: str
-) -> dict[int, FittedBooster]:
+def read_global_meta(boosters_dir: str | Path) -> dict[str, Any] | None:
+    meta_file = Path(boosters_dir) / GLOBAL_META_FILE
+    if not meta_file.exists():
+        return None
+    return json.loads(meta_file.read_text(encoding="utf-8"))
+
+
+def check_global_meta(meta: dict[str, Any], config: Config) -> None:
+    """Refuse boosters trained for another base model or prior."""
+    # Boosters trained before the meta recorded a base model were FSRS-7 ones.
+    base_model = str(meta.get("baseModel", "FSRS-7"))
+    prior = "default" if config.default_params else "trained"
+    if base_model != config.model_name or meta.get("priorMode", prior) != prior:
+        raise ValueError(
+            f"global boosters were trained for {base_model} ({meta.get('priorMode')} prior), "
+            f"not {config.model_name} ({prior} prior)"
+        )
+
+
+def load_global_boosters(boosters_dir: str | Path) -> dict[int, FittedBooster]:
     """Load pretrained per-fold global boosters written next to GLOBAL_META_FILE."""
     key = str(boosters_dir)
     if key not in _GLOBAL_CACHE:
         bdir = Path(boosters_dir)
-        meta = json.loads((bdir / GLOBAL_META_FILE).read_text(encoding="utf-8"))
+        meta = read_global_meta(bdir) or {}
         fold_map: dict[int, FittedBooster] = {}
         for f in meta.get("folds", []):
             booster = None
@@ -957,15 +979,8 @@ def load_global_boosters(
                 min_child_weight=float(f.get("minChildWeight", 5.0)),
                 gain_importance={},
             )
-        _GLOBAL_CACHE[key] = (meta, fold_map)
-    meta, fold_map = _GLOBAL_CACHE[key]
-    # Boosters trained before the meta recorded a base model were FSRS-7 ones.
-    trained_for = str(meta.get("baseModel", "FSRS-7"))
-    if trained_for != model_name:
-        raise ValueError(
-            f"Global boosters in {boosters_dir} were trained for {trained_for}, not {model_name}"
-        )
-    return fold_map
+        _GLOBAL_CACHE[key] = fold_map
+    return _GLOBAL_CACHE[key]
 
 
 class _OOFStates:
@@ -988,40 +1003,42 @@ class _OOFStates:
         return BaseStateArrays(**{f: arr[pos] for f, arr in self.cols.items()})
 
 
-def _no_booster(cfg: XGBoostConfig) -> FittedBooster:
-    nan = float("nan")
-    return FittedBooster(None, 0, 0.0, nan, nan, cfg.min_child_weight_floor, {})
+@dataclass
+class _Fold:
+    """One fold/partition of a user, with base states for its train and test rows."""
+
+    split_i: int
+    part_test: pd.DataFrame
+    X_train: np.ndarray
+    m_train: np.ndarray
+    y_train: np.ndarray
+    X_test: np.ndarray
+    m_test: np.ndarray
+    test_states: BaseStateArrays
+    b0_sub_end: int
+    prev_len: int
 
 
-def xgboost_predict(
+def _walk_folds(
     dataset: pd.DataFrame,
     w_list: list[dict[Any, Any]],
     trainsets: list[pd.DataFrame],
     testsets: list[pd.DataFrame],
     config: Config,
     fit_weights: Callable[[pd.DataFrame], Any],
-    xgb_config: XGBoostConfig | None = None,
-) -> list[pd.DataFrame]:
-    """Predict every fold's test set with the base model plus its XGBoost residual.
+):
+    """Yield every fold/partition with out-of-fold base states and feature matrices.
 
-    w_list, trainsets and testsets are the per-fold outputs of script.process. fit_weights
-    fits the base model on a DataFrame (used once, for fold 0's 75% sub-train fit).
-    Returns the fold/partition test sets with columns p, s and d, in fold order.
+    Training rows never see the fold's own weights: their base predictions come from the
+    previous fold's model; fold 0 uses a fit on its first 75% of rows (fit_weights).
     """
     from models.model_factory import create_model
 
-    cfg = xgb_config or XGBoostConfig()
     static = precompute_static_user_features(dataset)
     default_states = extract_base_states(create_model(config), dataset, config)
-    global_map = (
-        load_global_boosters(config.xgboost_boosters, config.model_name)
-        if config.xgboost == "global"
-        else None
-    )
     oof = _OOFStates(len(dataset))
     prev_model: dict[Any, Any] = {}
     prev_train_len: dict[Any, int] = {}
-    out: list[pd.DataFrame] = []
 
     for split_i, (w, train_set, test_set) in enumerate(
         zip(w_list, trainsets, testsets)
@@ -1047,7 +1064,6 @@ def xgboost_predict(
                             prev_model[partition], dataset.iloc[missing], config
                         )
                     elif len(missing) >= 40:
-                        # Fold 0: fit on the first 75% so training rows are mostly out of sample.
                         sub_pos = missing[: max(int(round(0.75 * len(missing))), 1)]
                         sub_model = create_model(
                             config, fit_weights(dataset.iloc[sub_pos].copy())
@@ -1071,6 +1087,14 @@ def xgboost_predict(
                 p_fsrs_seq=np.concatenate([train_states.p_fsrs, test_states.p_fsrs]),
                 is_same_day_seq=static.is_same_day_bool[fold_pos],
             )
+            X_train, m_train = build_feature_matrix(
+                static,
+                train_pos,
+                train_states,
+                default_states.logit_p[train_pos],
+                ewma_50[:n_train],
+                mode_ewma_100[:n_train],
+            )
             X_test, m_test = build_feature_matrix(
                 static,
                 test_pos,
@@ -1079,87 +1103,186 @@ def xgboost_predict(
                 ewma_50[n_train:],
                 mode_ewma_100[n_train:],
             )
-
-            if global_map is not None:
-                fitted = global_map.get(split_i, _no_booster(cfg))
-            elif n_train < cfg.min_subtrain_rows + cfg.min_val_rows:
-                fitted = _no_booster(cfg)
-            else:
-                fitted = _fit_user_booster(
-                    static,
-                    train_pos,
-                    train_states,
-                    default_states,
-                    ewma_50[:n_train],
-                    mode_ewma_100[:n_train],
-                    split_i=split_i,
-                    b0_sub_end=b0_sub_end,
-                    prev_len=prev_train_len.get(partition, 0),
-                    trained_prior=not config.default_params,
-                    cfg=cfg,
-                )
+            yield _Fold(
+                split_i=split_i,
+                part_test=part_test,
+                X_train=X_train,
+                m_train=m_train,
+                y_train=static.y[train_pos],
+                X_test=X_test,
+                m_test=m_test,
+                test_states=test_states,
+                b0_sub_end=b0_sub_end,
+                prev_len=prev_train_len.get(partition, 0),
+            )
             prev_train_len[partition] = n_train
 
-            part_test["p"] = predict_calibrated_prob(fitted, X_test, m_test)
-            part_test["s"] = test_states.s_long
-            part_test["d"] = test_states.d
-            out.append(part_test)
+
+def _training_arrays(
+    fold: _Fold, trained_prior: bool, cfg: XGBoostConfig
+) -> dict[str, np.ndarray] | None:
+    """Split a fold's train rows into sub-train / validation / full arrays with weights.
+
+    Validation is the rows new to this fold (fold 0: the rows after the 75% sub-train
+    fit), else the last 20%. None when the fold is too small to fit a booster.
+    """
+    n_train = len(fold.y_train)
+    if n_train < cfg.min_subtrain_rows + cfg.min_val_rows:
+        return None
+    b0 = fold.b0_sub_end if trained_prior else 0
+    start = b0 if fold.split_i == 0 else fold.prev_len
+    if start < cfg.min_subtrain_rows or n_train - start < cfg.min_val_rows:
+        start = int(round(0.80 * n_train))
+    v = int(np.clip(start, cfg.min_subtrain_rows, n_train - cfg.min_val_rows))
+    X, m, y = fold.X_train, fold.m_train, fold.y_train
+    return {
+        "X_sub": X[:v],
+        "y_sub": y[:v],
+        "m_sub": m[:v],
+        "w_sub": compute_recency_weights(v, cfg, b0_sub_end=min(b0, v)),
+        "X_val": X[v:],
+        "y_val": y[v:],
+        "m_val": m[v:],
+        "w_val": np.ones(n_train - v, dtype=np.float64),
+        "X_full": X,
+        "y_full": y,
+        "m_full": m,
+        "w_full": compute_recency_weights(n_train, cfg, b0_sub_end=b0),
+    }
+
+
+def _no_booster(cfg: XGBoostConfig) -> FittedBooster:
+    nan = float("nan")
+    return FittedBooster(None, 0, 0.0, nan, nan, cfg.min_child_weight_floor, {})
+
+
+def xgboost_predict(
+    dataset: pd.DataFrame,
+    w_list: list[dict[Any, Any]],
+    trainsets: list[pd.DataFrame],
+    testsets: list[pd.DataFrame],
+    config: Config,
+    fit_weights: Callable[[pd.DataFrame], Any],
+    xgb_config: XGBoostConfig | None = None,
+) -> list[pd.DataFrame]:
+    """Predict every fold's test set with the base model plus its XGBoost residual.
+
+    w_list, trainsets and testsets are the per-fold outputs of script._fit_folds.
+    Returns the fold/partition test sets with columns p, s and d, in fold order.
+    """
+    cfg = xgb_config or XGBoostConfig()
+    global_map = (
+        load_global_boosters(config.xgboost_boosters)
+        if config.xgboost == "global"
+        else None
+    )
+    out: list[pd.DataFrame] = []
+    for fold in _walk_folds(dataset, w_list, trainsets, testsets, config, fit_weights):
+        if global_map is not None:
+            fitted = global_map.get(fold.split_i, _no_booster(cfg))
+        else:
+            arrays = _training_arrays(fold, not config.default_params, cfg)
+            fitted = (
+                fit_fold_calibrator(**arrays, config=cfg, fold_idx=fold.split_i)
+                if arrays is not None
+                else _no_booster(cfg)
+            )
+        part_test = fold.part_test
+        part_test["p"] = predict_calibrated_prob(fitted, fold.X_test, fold.m_test)
+        part_test["s"] = fold.test_states.s_long
+        part_test["d"] = fold.test_states.d
+        out.append(part_test)
     return out
 
 
-def _fit_user_booster(
-    static: StaticUserFeatures,
-    train_pos: np.ndarray,
-    train_states: BaseStateArrays,
-    default_states: BaseStateArrays,
-    ewma_50: np.ndarray,
-    mode_ewma_100: np.ndarray,
-    *,
-    split_i: int,
-    b0_sub_end: int,
-    prev_len: int,
-    trained_prior: bool,
-    cfg: XGBoostConfig,
-) -> FittedBooster:
-    """Per-user booster: validate on the rows new to this fold, then refit on all of them."""
-    n_train = len(train_pos)
-    if split_i == 0:
-        ok = trained_prior and b0_sub_end >= cfg.min_subtrain_rows
-        val_start = b0_sub_end if ok and n_train - b0_sub_end >= cfg.min_val_rows else 0
-    else:
-        ok = (
-            prev_len >= cfg.min_subtrain_rows and n_train - prev_len >= cfg.min_val_rows
-        )
-        val_start = prev_len if ok else 0
-    if val_start == 0:
-        val_start = int(round(0.80 * n_train))
-    val_start = int(
-        np.clip(val_start, cfg.min_subtrain_rows, n_train - cfg.min_val_rows)
-    )
+# --------------------------------------------------------------------------------------
+# Global boosters: pooled over size-stratified anchor users, one booster per fold index
+# --------------------------------------------------------------------------------------
 
-    X, m = build_feature_matrix(
-        static,
-        train_pos,
-        train_states,
-        default_states.logit_p[train_pos],
-        ewma_50,
-        mode_ewma_100,
-    )
-    y = static.y[train_pos]
-    b0 = b0_sub_end if trained_prior else 0
-    return fit_fold_calibrator(
-        X_sub=X[:val_start],
-        y_sub=y[:val_start],
-        m_sub=m[:val_start],
-        w_sub=compute_recency_weights(val_start, cfg, b0_sub_end=min(b0, val_start)),
-        X_val=X[val_start:],
-        y_val=y[val_start:],
-        m_val=m[val_start:],
-        w_val=np.ones(n_train - val_start, dtype=np.float64),
-        X_full=X,
-        y_full=y,
-        m_full=m,
-        w_full=compute_recency_weights(n_train, cfg, b0_sub_end=b0),
-        config=cfg,
-        fold_idx=split_i,
+MAX_ROWS_PER_USER_FOLD = 15_000
+
+
+def select_anchor_users(users_by_size: list[int], n_anchors: int) -> list[int]:
+    """Evenly spaced users along a size-ordered list, so all user sizes are represented."""
+    if len(users_by_size) <= n_anchors:
+        return sorted(users_by_size)
+    idx = np.linspace(0, len(users_by_size) - 1, n_anchors, dtype=int)
+    return sorted({users_by_size[i] for i in idx})
+
+
+def xgboost_anchor_arrays(
+    dataset: pd.DataFrame,
+    w_list: list[dict[Any, Any]],
+    trainsets: list[pd.DataFrame],
+    testsets: list[pd.DataFrame],
+    config: Config,
+    fit_weights: Callable[[pd.DataFrame], Any],
+    xgb_config: XGBoostConfig | None = None,
+) -> dict[int, dict[str, np.ndarray]]:
+    """One anchor user's training arrays per fold index, capped to the most recent rows."""
+    cfg = xgb_config or XGBoostConfig()
+    out: dict[int, dict[str, np.ndarray]] = {}
+    for fold in _walk_folds(dataset, w_list, trainsets, testsets, config, fit_weights):
+        arrays = _training_arrays(fold, not config.default_params, cfg)
+        if arrays is None:
+            continue
+        for part in ("sub", "val", "full"):
+            keep = slice(-MAX_ROWS_PER_USER_FOLD, None)
+            w = arrays[f"w_{part}"][keep]
+            arrays[f"w_{part}"] = w / max(
+                len(w), 1
+            )  # every anchor user weighs the same
+            for k in ("X", "y", "m"):
+                arrays[f"{k}_{part}"] = arrays[f"{k}_{part}"][keep]
+        out[fold.split_i] = arrays
+    return out
+
+
+def train_global_boosters(
+    per_user: dict[int, dict[int, dict[str, np.ndarray]]],
+    config: Config,
+    out_dir: str | Path,
+    xgb_config: XGBoostConfig | None = None,
+) -> None:
+    """Fit one pooled booster per fold index and write fold_<k>.ubj plus the meta file."""
+    cfg = xgb_config or XGBoostConfig()
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    folds = []
+    for split_i in range(config.n_splits):
+        parts = [u[split_i] for u in per_user.values() if split_i in u]
+        if not parts:
+            continue
+        pooled = {
+            k: (np.vstack if k.startswith("X") else np.concatenate)(
+                [p[k] for p in parts]
+            )
+            for k in parts[0]
+        }
+        fitted = fit_fold_calibrator(**pooled, config=cfg, fold_idx=split_i)
+        model_file = None
+        if fitted.booster is not None:
+            model_file = f"fold_{split_i}.ubj"
+            fitted.booster.save_model(str(out_dir / model_file))
+        folds.append(
+            {
+                "fold": split_i,
+                "pooledTrainRows": int(len(pooled["y_full"])),
+                "bestTrees": fitted.best_ntree,
+                "alpha": round(fitted.alpha, 6),
+                "baseValLoss": round(fitted.base_val_loss, 6),
+                "calValLoss": round(fitted.cal_val_loss, 6),
+                "minChildWeight": round(fitted.min_child_weight, 4),
+                "modelFile": model_file,
+            }
+        )
+    meta = {
+        "baseModel": config.model_name,
+        "priorMode": "default" if config.default_params else "trained",
+        "xgboostVersion": xgb.__version__,
+        "anchorUserIds": sorted(per_user),
+        "folds": folds,
+    }
+    (out_dir / GLOBAL_META_FILE).write_text(
+        json.dumps(meta, indent=2) + "\n", encoding="utf-8"
     )

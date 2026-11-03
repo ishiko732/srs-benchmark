@@ -28,7 +28,13 @@ from model_processors import (
     process_untrainable,
     rmse_bins_exploit,
 )
-from models.fsrs_xgboost import xgboost_predict
+from models.fsrs_xgboost import (
+    read_global_meta,
+    select_anchor_users,
+    train_global_boosters,
+    xgboost_anchor_arrays,
+    xgboost_predict,
+)
 from models.model_factory import create_model
 from models.trainable import TrainableModel
 from utils import (
@@ -417,34 +423,10 @@ def _fit_trainable_weights(train_df: pd.DataFrame) -> Any:
     return trainer.train()
 
 
-@catch_exceptions
-# `raw` is a pre-serialized JSON *string* (see the note in utils.evaluate): the heavy
-# json.dumps is done in the worker, not the serial collector, so what comes back is a
-# ready line rather than a dict.
-def process(user_id: int, device_id: int | None = None) -> tuple[dict, str | None]:
-    """Main processing function for all models."""
-    plt.close("all")
-    _configure_process_device(device_id)
-
-    # Load data once for all models
-    data_loader = UserDataLoader(config)
-    dataset = data_loader.load_user_data(user_id)
-
-    # Handle special cases
-    if config.model_name == "SM2" or config.model_name.startswith("Ebisu"):
-        return process_untrainable(user_id, dataset, config)
-    if config.model_name == "AVG":
-        return baseline(user_id, dataset, config)
-    if config.model_name == "RMSE-BINS-EXPLOIT":
-        return rmse_bins_exploit(user_id, dataset, config)
-    if config.model_name == "MOVING-AVG":
-        return moving_avg(user_id, dataset, config)
-    if config.model_name == "FSRS-6-one-step":
-        return fsrs_one_step(user_id, dataset, config)
-    if config.model_name == "FSRS-rs":
-        return process_fsrs_rs(user_id, dataset, config)
-
-    # Process trainable models
+def _fit_folds(
+    user_id: int, dataset: pd.DataFrame
+) -> tuple[list[dict], list[pd.DataFrame], list[pd.DataFrame]]:
+    """Fit the model on every TimeSeriesSplit fold: (weights, train set, test set) per fold."""
     use_double_fallback = _is_deck_or_preset_partition_mode()
     w_list = []
     trainsets = []
@@ -540,6 +522,70 @@ def process(user_id: int, device_id: int | None = None) -> tuple[dict, str | Non
         if config.train_equals_test:
             break
 
+    return w_list, trainsets, testsets
+
+
+def _fit_with_recency(train_df: pd.DataFrame) -> Any:
+    return _fit_trainable_weights(_apply_recency_weighting(train_df))
+
+
+@catch_exceptions
+def xgboost_anchor(user_id: int) -> dict:
+    """Training arrays of one anchor user for the global XGBoost boosters."""
+    dataset = UserDataLoader(config).load_user_data(user_id)
+    w_list, trainsets, testsets = _fit_folds(user_id, dataset)
+    return xgboost_anchor_arrays(
+        dataset, w_list, trainsets, testsets, config, _fit_with_recency
+    )
+
+
+def pretrain_global_xgboost(users_by_size: list[int]) -> None:
+    """Fit the global boosters on size-stratified anchor users (FSRS-XGBoost, global)."""
+    anchors = select_anchor_users(users_by_size, config.xgboost_anchors)
+    per_user = {}
+    with ProcessPoolExecutor(max_workers=config.num_processes) as executor:
+        futures = {executor.submit(xgboost_anchor, u): u for u in anchors}
+        for future in tqdm(
+            as_completed(futures), total=len(futures), disable=not sys.stderr.isatty()
+        ):
+            result, error = future.result()
+            if error:
+                tqdm.write(str(error))
+            else:
+                per_user[futures[future]] = result
+    train_global_boosters(per_user, config, config.xgboost_boosters)
+
+
+@catch_exceptions
+# `raw` is a pre-serialized JSON *string* (see the note in utils.evaluate): the heavy
+# json.dumps is done in the worker, not the serial collector, so what comes back is a
+# ready line rather than a dict.
+def process(user_id: int, device_id: int | None = None) -> tuple[dict, str | None]:
+    """Main processing function for all models."""
+    plt.close("all")
+    _configure_process_device(device_id)
+
+    # Load data once for all models
+    data_loader = UserDataLoader(config)
+    dataset = data_loader.load_user_data(user_id)
+
+    # Handle special cases
+    if config.model_name == "SM2" or config.model_name.startswith("Ebisu"):
+        return process_untrainable(user_id, dataset, config)
+    if config.model_name == "AVG":
+        return baseline(user_id, dataset, config)
+    if config.model_name == "RMSE-BINS-EXPLOIT":
+        return rmse_bins_exploit(user_id, dataset, config)
+    if config.model_name == "MOVING-AVG":
+        return moving_avg(user_id, dataset, config)
+    if config.model_name == "FSRS-6-one-step":
+        return fsrs_one_step(user_id, dataset, config)
+    if config.model_name == "FSRS-rs":
+        return process_fsrs_rs(user_id, dataset, config)
+
+    # Process trainable models
+    w_list, trainsets, testsets = _fit_folds(user_id, dataset)
+
     p = []
     y = []
     save_tmp = []
@@ -554,7 +600,7 @@ def process(user_id: int, device_id: int | None = None) -> tuple[dict, str | Non
             trainsets,
             testsets,
             config,
-            fit_weights=lambda df: _fit_trainable_weights(_apply_recency_weighting(df)),
+            fit_weights=_fit_with_recency,
         )
         for partition_testset in save_tmp:
             p.extend(partition_testset["p"].tolist())
@@ -620,8 +666,10 @@ if __name__ == "__main__":
     if config.save_raw_output and raw_file.exists():
         sort_jsonl_by_user_lines(raw_file)
 
+    all_users = []
     for user_id in dataset.partitioning.dictionaries[0]:
         user_id_value = user_id.as_py()
+        all_users.append(user_id_value)
         # Add the filter here
         if config.max_user_id is not None and user_id_value > config.max_user_id:
             continue
@@ -675,6 +723,11 @@ if __name__ == "__main__":
     # pyrefly: ignore [missing-attribute]
     if config.device.type == "cpu":
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+    if config.xgboost == "global" and read_global_meta(config.xgboost_boosters) is None:
+        pretrain_global_xgboost(
+            sorted(all_users, key=lambda u: _lpt_rank.get(u, len(_lpt_rank)))
+        )
 
     with ProcessPoolExecutor(max_workers=config.num_processes) as executor:
         futures = [

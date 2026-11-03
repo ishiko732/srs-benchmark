@@ -95,7 +95,13 @@ def create_parser():
     parser.add_argument(
         "--xgboost_boosters",
         default=None,
-        help="directory with pretrained global boosters (global_boosters_meta.json + fold_*.ubj) for --xgboost global",
+        help="directory of the global boosters for --xgboost global (global_boosters_meta.json + fold_*.ubj); trained there first when it has none",
+    )
+    parser.add_argument(
+        "--xgboost_anchors",
+        type=int,
+        default=300,
+        help="number of size-stratified users the global boosters are trained on (default: 300)",
     )
     parser.add_argument(
         "--compile",
@@ -236,16 +242,14 @@ class Config:
         self.xgboost_boosters: str | None = args.xgboost_boosters
         if self.xgboost == "global" and not self.xgboost_boosters:
             raise ValueError("--xgboost global requires --xgboost_boosters")
+        self.xgboost_anchors: int = args.xgboost_anchors
         if self.xgboost == "global":
-            # Fail before any user runs if the boosters belong to another base model.
-            meta_file = Path(self.xgboost_boosters) / "global_boosters_meta.json"
-            trained_for = json.loads(meta_file.read_text(encoding="utf-8")).get(
-                "baseModel", "FSRS-7"
-            )
-            if trained_for != args.algo:
-                raise ValueError(
-                    f"--xgboost_boosters were trained for {trained_for}, not {args.algo}"
-                )
+            # Fail before any user runs if existing boosters belong to another model/prior.
+            from models.fsrs_xgboost import check_global_meta, read_global_meta
+
+            meta = read_global_meta(self.xgboost_boosters)
+            if meta is not None:
+                check_global_meta(meta, self)
         self.use_compile: bool = (
             args.compile
         )  # torch.compile FSRS-7 forward (FSRS-7 only)
