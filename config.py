@@ -160,7 +160,9 @@ def create_parser():
         "--short", action="store_true", help="include short-term reviews"
     )
     parser.add_argument(
-        "--weights", action="store_true", help="save neural network weights"
+        "--weights",
+        action="store_true",
+        help="save neural network weights (and, with --xgboost per-user, each user's last-fold booster)",
     )
     parser.add_argument(
         "--train_equals_test",

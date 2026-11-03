@@ -22,6 +22,8 @@ short-term stability and two curve components) are NaN, which XGBoost routes nat
 
 Scopes:
 - per-user: one booster per user and fold, trained on that user's train split.
+  With --weights, the last fold's booster is saved per user (_save_user_booster),
+  matching the last-fold parameters in the result file.
 - global: one booster per fold index, pooled over --xgboost_anchors users picked evenly
   along the user-size order (each user weighs the same, at most 15,000 recent rows per
   fold). They are trained into --xgboost_boosters on the first run and reused after
@@ -1205,12 +1207,41 @@ def xgboost_predict(
                 if arrays is not None
                 else _no_booster(cfg)
             )
+        if (
+            config.save_weights
+            and global_map is None
+            and fold.split_i == len(w_list) - 1
+        ):
+            _save_user_booster(fitted, fold, config, user_id)
         part_test = fold.part_test
         part_test["p"] = predict_calibrated_prob(fitted, fold.X_test, fold.m_test)
         part_test["s"] = fold.test_states.s_long
         part_test["d"] = fold.test_states.d
         out.append(part_test)
     return out
+
+
+def _save_user_booster(
+    fitted: FittedBooster, fold: _Fold, config: Config, user_id: int | None
+) -> None:
+    """--weights: keep the last fold's per-user booster next to the result's parameters
+    (also the last fold's), as weights/<result name>/<user>[_<partition>].ubj + .json."""
+    out_dir = Path("weights") / config.get_evaluation_file_name()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    partition = fold.part_test["partition"].iloc[0]
+    stem = f"{user_id}" if config.partitions == "none" else f"{user_id}_{partition}"
+    model_file = None
+    if fitted.booster is not None:
+        model_file = f"{stem}.ubj"
+        fitted.booster.save_model(str(out_dir / model_file))
+    meta = {
+        "fold": fold.split_i,
+        "alpha": fitted.alpha,
+        "bestTrees": fitted.best_ntree,
+        "modelFile": model_file,
+        "features": list(FEATURE_NAMES),
+    }
+    (out_dir / f"{stem}.json").write_text(json.dumps(meta) + "\n", encoding="utf-8")
 
 
 # --------------------------------------------------------------------------------------
