@@ -32,6 +32,7 @@ from models.fsrs_xgboost import (
     read_global_meta,
     select_anchor_users,
     train_global_boosters,
+    user_half,
     xgboost_anchor_arrays,
     xgboost_predict,
 )
@@ -541,7 +542,15 @@ def xgboost_anchor(user_id: int) -> dict:
 
 def pretrain_global_xgboost(users_by_size: list[int]) -> None:
     """Fit the global boosters on size-stratified anchor users (FSRS-XGBoost, global)."""
-    anchors = select_anchor_users(users_by_size, config.xgboost_anchors)
+    # global-split: anchors are picked within each half so each half gets its own boosters.
+    halves = (
+        [[u for u in users_by_size if user_half(u) == h] for h in (0, 1)]
+        if config.xgboost == "global-split"
+        else [users_by_size]
+    )
+    anchors = [
+        u for h in halves for u in select_anchor_users(h, config.xgboost_anchors)
+    ]
     per_user = {}
     with ProcessPoolExecutor(max_workers=config.num_processes) as executor:
         futures = {executor.submit(xgboost_anchor, u): u for u in anchors}
@@ -601,6 +610,7 @@ def process(user_id: int, device_id: int | None = None) -> tuple[dict, str | Non
             testsets,
             config,
             fit_weights=_fit_with_recency,
+            user_id=user_id,
         )
         for partition_testset in save_tmp:
             p.extend(partition_testset["p"].tolist())
@@ -724,7 +734,9 @@ if __name__ == "__main__":
     if config.device.type == "cpu":
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
-    if config.xgboost == "global" and read_global_meta(config.xgboost_boosters) is None:
+    if config.xgboost in ("global", "global-split") and (
+        read_global_meta(config.xgboost_boosters) is None
+    ):
         pretrain_global_xgboost(
             sorted(all_users, key=lambda u: _lpt_rank.get(u, len(_lpt_rank)))
         )

@@ -88,9 +88,9 @@ def create_parser():
     )
     parser.add_argument(
         "--xgboost",
-        choices=["per-user", "global"],
+        choices=["per-user", "global", "global-split"],
         default=None,
-        help="FSRS-XGBoost: add an XGBoost logit residual on top of the base FSRS model (models/fsrs_xgboost.py). per-user fits one booster per user and fold; global loads pretrained boosters from --xgboost_boosters. (default: off)",
+        help="FSRS-XGBoost: add an XGBoost logit residual on top of the base FSRS model (models/fsrs_xgboost.py). per-user fits one booster per user and fold; global pools anchor users into one booster per fold (--xgboost_boosters); global-split trains one set per half of the users (user_id < 5000 / >= 5000) and scores each user with the other half's boosters. (default: off)",
     )
     parser.add_argument(
         "--xgboost_boosters",
@@ -240,10 +240,10 @@ class Config:
         self.sched_penalties: bool = args.sched_penalties  # only for FSRS-7
         self.xgboost: str | None = args.xgboost
         self.xgboost_boosters: str | None = args.xgboost_boosters
-        if self.xgboost == "global" and not self.xgboost_boosters:
-            raise ValueError("--xgboost global requires --xgboost_boosters")
+        if self.xgboost in ("global", "global-split") and not self.xgboost_boosters:
+            raise ValueError(f"--xgboost {self.xgboost} requires --xgboost_boosters")
         self.xgboost_anchors: int = args.xgboost_anchors
-        if self.xgboost == "global":
+        if self.xgboost in ("global", "global-split"):
             # Fail before any user runs if existing boosters belong to another model/prior.
             from models.fsrs_xgboost import check_global_meta, read_global_meta
 
@@ -316,6 +316,8 @@ class Config:
             _file_name_parts.append("-xgboost")
         elif self.xgboost == "global":
             _file_name_parts.append("-xgboost_global")
+        elif self.xgboost == "global-split":
+            _file_name_parts.append("-xgboost_global_split")
         if self.two_buttons:
             # Suffix is '-binary' for backward compatibility with existing analysis scripts.
             _file_name_parts.append("-binary")

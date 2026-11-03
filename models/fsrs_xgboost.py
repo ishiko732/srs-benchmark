@@ -26,6 +26,9 @@ Scopes:
   along the user-size order (each user weighs the same, at most 15,000 recent rows per
   fold). They are trained into --xgboost_boosters on the first run and reused after
   that; the meta file records the base model and prior they belong to.
+- global-split: as global, but the users are split in two halves (user_id < 5000 and
+  >= 5000, as for RWKV) with anchors and boosters per half. Each user is scored with the
+  other half's boosters, so no user is scored by a booster trained on its own reviews.
 
     python script.py --algo FSRS-7 --xgboost global --xgboost_boosters boosters/fsrs7 \
         --short --secs --recency
@@ -936,7 +939,7 @@ def predict_calibrated_prob(
 # --------------------------------------------------------------------------------------
 
 GLOBAL_META_FILE = "global_boosters_meta.json"
-_GLOBAL_CACHE: dict[str, dict[int, FittedBooster]] = {}
+_GLOBAL_CACHE: dict[str, dict[tuple[int | None, int], FittedBooster]] = {}
 
 
 def read_global_meta(boosters_dir: str | Path) -> dict[str, Any] | None:
@@ -946,31 +949,43 @@ def read_global_meta(boosters_dir: str | Path) -> dict[str, Any] | None:
     return json.loads(meta_file.read_text(encoding="utf-8"))
 
 
+def user_half(user_id: int) -> int:
+    """global-split halves: 0 for user_id < 5000, 1 otherwise."""
+    return int(user_id >= 5000)
+
+
 def check_global_meta(meta: dict[str, Any], config: Config) -> None:
-    """Refuse boosters trained for another base model or prior."""
-    # Boosters trained before the meta recorded a base model were FSRS-7 ones.
+    """Refuse boosters trained for another scope, base model or prior."""
+    # Boosters trained before the meta recorded these were global FSRS-7 ones.
+    scope = str(meta.get("scope", "global"))
     base_model = str(meta.get("baseModel", "FSRS-7"))
     prior = "default" if config.default_params else "trained"
-    if base_model != config.model_name or meta.get("priorMode", prior) != prior:
+    if (
+        scope != config.xgboost
+        or base_model != config.model_name
+        or meta.get("priorMode", prior) != prior
+    ):
         raise ValueError(
-            f"global boosters were trained for {base_model} ({meta.get('priorMode')} prior), "
-            f"not {config.model_name} ({prior} prior)"
+            f"boosters were trained for {scope} {base_model} ({meta.get('priorMode')} prior), "
+            f"not {config.xgboost} {config.model_name} ({prior} prior)"
         )
 
 
-def load_global_boosters(boosters_dir: str | Path) -> dict[int, FittedBooster]:
-    """Load pretrained per-fold global boosters written next to GLOBAL_META_FILE."""
+def load_global_boosters(
+    boosters_dir: str | Path,
+) -> dict[tuple[int | None, int], FittedBooster]:
+    """Load pretrained boosters keyed by (half, fold); half is None for global."""
     key = str(boosters_dir)
     if key not in _GLOBAL_CACHE:
         bdir = Path(boosters_dir)
         meta = read_global_meta(bdir) or {}
-        fold_map: dict[int, FittedBooster] = {}
+        fold_map: dict[tuple[int | None, int], FittedBooster] = {}
         for f in meta.get("folds", []):
             booster = None
             if f.get("modelFile"):
                 booster = xgb.Booster(params={"nthread": 1})
                 booster.load_model(str(bdir / str(f["modelFile"])))
-            fold_map[int(f["fold"])] = FittedBooster(
+            fold_map[(f.get("half"), int(f["fold"]))] = FittedBooster(
                 booster=booster,
                 best_ntree=int(f.get("bestTrees", 0)),
                 alpha=float(f.get("alpha", 0.0)),
@@ -1164,6 +1179,7 @@ def xgboost_predict(
     config: Config,
     fit_weights: Callable[[pd.DataFrame], Any],
     xgb_config: XGBoostConfig | None = None,
+    user_id: int | None = None,
 ) -> list[pd.DataFrame]:
     """Predict every fold's test set with the base model plus its XGBoost residual.
 
@@ -1171,15 +1187,17 @@ def xgboost_predict(
     Returns the fold/partition test sets with columns p, s and d, in fold order.
     """
     cfg = xgb_config or XGBoostConfig()
-    global_map = (
-        load_global_boosters(config.xgboost_boosters)
-        if config.xgboost == "global"
-        else None
-    )
+    global_map = None
+    half = None
+    if config.xgboost in ("global", "global-split"):
+        global_map = load_global_boosters(config.xgboost_boosters)
+        if config.xgboost == "global-split":
+            assert user_id is not None
+            half = 1 - user_half(user_id)  # the other half's boosters
     out: list[pd.DataFrame] = []
     for fold in _walk_folds(dataset, w_list, trainsets, testsets, config, fit_weights):
         if global_map is not None:
-            fitted = global_map.get(fold.split_i, _no_booster(cfg))
+            fitted = global_map.get((half, fold.split_i), _no_booster(cfg))
         else:
             arrays = _training_arrays(fold, not config.default_params, cfg)
             fitted = (
@@ -1244,13 +1262,19 @@ def train_global_boosters(
     out_dir: str | Path,
     xgb_config: XGBoostConfig | None = None,
 ) -> None:
-    """Fit one pooled booster per fold index and write fold_<k>.ubj plus the meta file."""
+    """Fit one pooled booster per fold index (per half for global-split) and write
+    [half<h>_]fold_<k>.ubj plus the meta file."""
     cfg = xgb_config or XGBoostConfig()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    halves = (0, 1) if config.xgboost == "global-split" else (None,)
     folds = []
-    for split_i in range(config.n_splits):
-        parts = [u[split_i] for u in per_user.values() if split_i in u]
+    for half, split_i in ((h, k) for h in halves for k in range(config.n_splits)):
+        parts = [
+            arrays[split_i]
+            for u, arrays in per_user.items()
+            if split_i in arrays and (half is None or user_half(u) == half)
+        ]
         if not parts:
             continue
         pooled = {
@@ -1262,10 +1286,11 @@ def train_global_boosters(
         fitted = fit_fold_calibrator(**pooled, config=cfg, fold_idx=split_i)
         model_file = None
         if fitted.booster is not None:
-            model_file = f"fold_{split_i}.ubj"
+            model_file = f"{'' if half is None else f'half{half}_'}fold_{split_i}.ubj"
             fitted.booster.save_model(str(out_dir / model_file))
         folds.append(
             {
+                "half": half,
                 "fold": split_i,
                 "pooledTrainRows": int(len(pooled["y_full"])),
                 "bestTrees": fitted.best_ntree,
@@ -1277,6 +1302,7 @@ def train_global_boosters(
             }
         )
     meta = {
+        "scope": config.xgboost,
         "baseModel": config.model_name,
         "priorMode": "default" if config.default_params else "trained",
         "xgboostVersion": xgb.__version__,
