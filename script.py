@@ -29,8 +29,10 @@ from model_processors import (
     rmse_bins_exploit,
 )
 from models.fsrs_xgboost import (
+    fold0_subfit_frames,
     read_global_meta,
     select_anchor_users,
+    subfit_key,
     train_global_boosters,
     user_half,
     xgboost_anchor_arrays,
@@ -427,7 +429,11 @@ def _fit_trainable_weights(train_df: pd.DataFrame) -> Any:
 def _fit_folds(
     user_id: int, dataset: pd.DataFrame
 ) -> tuple[list[dict], list[pd.DataFrame], list[pd.DataFrame]]:
-    """Fit the model on every TimeSeriesSplit fold: (weights, train set, test set) per fold."""
+    """Fit the model on every TimeSeriesSplit fold: (weights, train set, test set) per fold.
+
+    With --fold_weights, a user's saved per-fold weights replace the fits.
+    """
+    saved = _load_fold_weights(user_id)
     use_double_fallback = _is_deck_or_preset_partition_mode()
     w_list = []
     trainsets = []
@@ -455,6 +461,12 @@ def _fit_folds(
 
         trainsets.append(train_set)
         testsets.append(test_set)
+
+        if saved is not None:
+            w_list.append(saved["w_list"][split_i])
+            if config.train_equals_test:
+                break
+            continue
 
         # User-level fallback (per split), only for deck/preset partitioning
         user_level_weights = None
@@ -530,13 +542,64 @@ def _fit_with_recency(train_df: pd.DataFrame) -> Any:
     return _fit_trainable_weights(_apply_recency_weighting(train_df))
 
 
+def _fold_weights_file(directory: str | Path, user_id: int) -> Path:
+    return Path(directory) / f"{user_id}.pth"
+
+
+def _load_fold_weights(user_id: int) -> dict | None:
+    if not config.fold_weights_dir:
+        return None
+    path = _fold_weights_file(config.fold_weights_dir, user_id)
+    if not path.exists():
+        return None
+    # Our own --save_fold_weights output; partition keys are numpy scalars.
+    saved = torch.load(path, weights_only=False)
+    if len(saved["w_list"]) < (1 if config.train_equals_test else config.n_splits):
+        raise ValueError(
+            f"{path}: {len(saved['w_list'])} folds, expected {config.n_splits}"
+        )
+    return saved
+
+
+def _save_fold_weights(user_id: int, w_list: list, trainsets: list) -> None:
+    """Save every fold's weights and the fold-0 sub-fits FSRS-XGBoost would refit."""
+    subfits = {}
+    if not config.default_params and trainsets:
+        for frame in fold0_subfit_frames(trainsets[0]):
+            try:
+                subfits[subfit_key(frame)] = copy.deepcopy(_fit_with_recency(frame))
+            except Exception as e:
+                # FSRS-XGBoost refits (and fails) the same way when the sub-fit is absent.
+                if not _is_inadequate_training_data_error(e):
+                    raise
+    directory = Path("fold_weights") / config.get_evaluation_file_name()
+    directory.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {"w_list": w_list, "subfits": subfits}, _fold_weights_file(directory, user_id)
+    )
+
+
+def _fit_weights_for(user_id: int):
+    """fit_weights for FSRS-XGBoost: saved fold-0 sub-fits first, else a recency fit."""
+    saved = _load_fold_weights(user_id)
+    subfits = saved.get("subfits", {}) if saved else {}
+
+    def fit(train_df: pd.DataFrame) -> Any:
+        key = subfit_key(train_df)
+        if key in subfits:
+            return subfits[key]
+        return _fit_with_recency(train_df)
+
+    return fit
+
+
 @catch_exceptions
 def xgboost_anchor(user_id: int) -> dict:
     """Training arrays of one anchor user for the global XGBoost boosters."""
     dataset = UserDataLoader(config).load_user_data(user_id)
     w_list, trainsets, testsets = _fit_folds(user_id, dataset)
     return xgboost_anchor_arrays(
-        dataset, w_list, trainsets, testsets, config, _fit_with_recency
+        dataset, w_list, trainsets, testsets, config, _fit_weights_for(user_id)
     )
 
 
@@ -594,6 +657,8 @@ def process(user_id: int, device_id: int | None = None) -> tuple[dict, str | Non
 
     # Process trainable models
     w_list, trainsets, testsets = _fit_folds(user_id, dataset)
+    if config.save_fold_weights:
+        _save_fold_weights(user_id, w_list, trainsets)
 
     p = []
     y = []
@@ -609,7 +674,7 @@ def process(user_id: int, device_id: int | None = None) -> tuple[dict, str | Non
             trainsets,
             testsets,
             config,
-            fit_weights=_fit_with_recency,
+            fit_weights=_fit_weights_for(user_id),
             user_id=user_id,
         )
         for partition_testset in save_tmp:

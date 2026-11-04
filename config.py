@@ -165,6 +165,16 @@ def create_parser():
         help="save neural network weights (and, with --xgboost per-user, each user's last-fold booster)",
     )
     parser.add_argument(
+        "--save_fold_weights",
+        action="store_true",
+        help="save every fold's fitted weights per user to fold_weights/<result name>/<user>.pth (plus the fold-0 75%% sub-fit FSRS-XGBoost needs), for reuse with --fold_weights",
+    )
+    parser.add_argument(
+        "--fold_weights",
+        default=None,
+        help="directory of --save_fold_weights files (<user>.pth) to load instead of refitting each fold; users without a file are fitted as usual",
+    )
+    parser.add_argument(
         "--train_equals_test",
         action="store_true",
         help="Set train set equal to test set without splitting",
@@ -258,6 +268,8 @@ class Config:
         self.save_evaluation_file: bool = args.file
         self.generate_plots: bool = args.plot
         self.save_weights: bool = args.weights
+        self.save_fold_weights: bool = args.save_fold_weights
+        self.fold_weights_dir: str | None = args.fold_weights
         self.partitions: str = args.partitions
         self.save_raw_output: bool = args.raw
         self.num_processes: int = args.processes

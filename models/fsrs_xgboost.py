@@ -1036,6 +1036,35 @@ class _Fold:
     prev_len: int
 
 
+FOLD0_SUBFIT_MIN_ROWS = 40
+
+
+def fold0_subfit_size(n_rows: int) -> int:
+    """Rows of the fold-0 sub-fit: the first 75% of the fold's training rows."""
+    return max(round(0.75 * n_rows), 1)
+
+
+def fold0_subfit_frames(train_set: pd.DataFrame) -> list[pd.DataFrame]:
+    """The frames _walk_folds hands to fit_weights for fold 0 (one per partition).
+
+    Fold 0 has no previous model, so every partition with enough training rows gets a
+    fit on its first 75% rows. --save_fold_weights precomputes these so --fold_weights
+    can skip them.
+    """
+    frames = []
+    for partition in train_set["partition"].unique():
+        part_train = train_set[train_set["partition"] == partition]
+        if len(part_train) >= FOLD0_SUBFIT_MIN_ROWS:
+            frames.append(part_train.iloc[: fold0_subfit_size(len(part_train))].copy())
+    return frames
+
+
+def subfit_key(frame: pd.DataFrame) -> str:
+    """Identify a sub-fit frame by its row count and first/last review_th."""
+    rth = frame["review_th"]
+    return f"{len(frame)}:{int(rth.iloc[0])}:{int(rth.iloc[-1])}"
+
+
 def _walk_folds(
     dataset: pd.DataFrame,
     w_list: list[dict[Any, Any]],
@@ -1080,8 +1109,8 @@ def _walk_folds(
                         fill = extract_base_states(
                             prev_model[partition], dataset.iloc[missing], config
                         )
-                    elif len(missing) >= 40:
-                        sub_pos = missing[: max(int(round(0.75 * len(missing))), 1)]
+                    elif len(missing) >= FOLD0_SUBFIT_MIN_ROWS:
+                        sub_pos = missing[: fold0_subfit_size(len(missing))]
                         sub_model = create_model(
                             config, fit_weights(dataset.iloc[sub_pos].copy())
                         )
