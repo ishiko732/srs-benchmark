@@ -2,7 +2,7 @@ from typing import Any, cast
 
 import pandas as pd
 
-from .base import BaseFeatureEngineer
+from .base import BaseFeatureEngineer, _card_run_bounds
 
 
 class SM2FeatureEngineer(BaseFeatureEngineer):
@@ -30,13 +30,17 @@ class EbisuFeatureEngineer(BaseFeatureEngineer):
         """
         Create Ebisu features: sequence of (time_interval, rating) tuples
         """
-        t_history_list, r_history_list = self.get_history_lists(df)
+        n = len(df)
+        if n == 0:
+            cast(Any, df)["sequence"] = []
+            return df
 
-        # Create tuple sequences for Ebisu
-        cast(Any, df)["sequence"] = [
-            tuple(zip(t_item[:-1], r_item[:-1]))
-            for t_sublist, r_sublist in zip(t_history_list, r_history_list)
-            for t_item, r_item in zip(t_sublist, r_sublist)
-        ]
+        pairs = list(zip(list(df["delta_t"].to_numpy()), list(df["rating"].to_numpy())))
+        starts, ends = _card_run_bounds(df["card_id"].to_numpy())
+        sequences: list = []
+        for s, e in zip(starts.tolist(), ends.tolist()):
+            card_pairs = tuple(pairs[s : e - 1])
+            sequences.extend(card_pairs[:j] for j in range(e - s))
 
+        cast(Any, df)["sequence"] = sequences
         return df

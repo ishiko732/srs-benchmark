@@ -1,9 +1,10 @@
 from typing import Any, cast
 
+import numpy as np
 import pandas as pd
 import torch
 
-from .base import BaseFeatureEngineer
+from .base import BaseFeatureEngineer, _card_run_bounds
 
 
 class FSRSFeatureEngineer(BaseFeatureEngineer):
@@ -17,20 +18,23 @@ class FSRSFeatureEngineer(BaseFeatureEngineer):
         Create tensor features for FSRS-style models
         These models use (time_history, rating_history) tensors
         """
-        t_history_list, r_history_list = self.get_history_lists(df)
+        n = len(df)
+        if n == 0:
+            cast(Any, df)["tensor"] = []
+            return df
 
-        # Create tensor features with shape (sequence_length, 2): each row is
-        # [time_interval, rating] for that step. Build ONE [k, 2] float32 tensor per card
-        # from its full (t, r) sequence, then take prefix views: review j's tensor is the
-        # first j rows. Bit-identical to torch.tensor((t_item[:-1], r_item[:-1])) per
-        # review (same float32 from the same values), but avoids one torch.tensor() call
-        # per review and shrinks the intermediate column from O(k^2) to O(k) per card.
-        tensors: list = []
-        for t_sublist, r_sublist in zip(t_history_list, r_history_list):
-            full = torch.tensor(
-                (t_sublist[-1], r_sublist[-1]), dtype=torch.float32
-            ).transpose(0, 1)
-            tensors.extend(full[:j] for j in range(len(t_sublist)))
-        cast(Any, df)["tensor"] = tensors
+        # Build ONE user-wide contiguous [N, 2] float32 tensor from (delta_t, rating),
+        # then slice zero-copy prefix views per card.
+        arr = np.empty((n, 2), dtype=np.float32)
+        arr[:, 0] = df["delta_t"].to_numpy(dtype=np.float32)
+        arr[:, 1] = df["rating"].to_numpy(dtype=np.float32)
+        full = torch.from_numpy(arr)
+
+        starts, ends = _card_run_bounds(df["card_id"].to_numpy())
+        cast(Any, df)["tensor"] = [
+            full[s : s + j]
+            for s, e in zip(starts.tolist(), ends.tolist())
+            for j in range(e - s)
+        ]
 
         return df

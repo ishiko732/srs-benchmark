@@ -1,9 +1,10 @@
 from typing import Any, cast
 
+import numpy as np
 import pandas as pd
 import torch
 
-from .base import BaseFeatureEngineer
+from .base import BaseFeatureEngineer, _card_run_bounds
 
 
 class FSRSOneStepFeatureEngineer(BaseFeatureEngineer):
@@ -17,21 +18,34 @@ class FSRSOneStepFeatureEngineer(BaseFeatureEngineer):
         Create tensor features for FSRS-style models
         These models use (time_history, rating_history) tensors
         """
-        t_history_list, r_history_list = self.get_history_lists(df)
+        n = len(df)
+        if n == 0:
+            cast(Any, df)["tensor"] = []
+            cast(Any, df)["inputs"] = []
+            return df
 
-        # Create tensor features with shape (sequence_length, 2)
-        # Each row contains [time_interval, rating] for that step
-        cast(Any, df)["tensor"] = [
-            torch.tensor((t_item[:-1], r_item[:-1]), dtype=torch.float32).transpose(
-                0, 1
-            )
-            for t_sublist, r_sublist in zip(t_history_list, r_history_list)
-            for t_item, r_item in zip(t_sublist, r_sublist)
-        ]
-        cast(Any, df)["inputs"] = [
-            tuple(zip(t_item[:-1], r_item[:-1]))
-            for t_sublist, r_sublist in zip(t_history_list, r_history_list)
-            for t_item, r_item in zip(t_sublist, r_sublist)
-        ]
+        dt_np = df["delta_t"].to_numpy()
+        r_np = df["rating"].to_numpy()
+
+        arr = np.empty((n, 2), dtype=np.float32)
+        arr[:, 0] = dt_np.astype(np.float32)
+        arr[:, 1] = r_np.astype(np.float32)
+        full = torch.from_numpy(arr)
+
+        pairs = list(zip(list(dt_np), list(r_np)))
+        starts, ends = _card_run_bounds(df["card_id"].to_numpy())
+        starts_l = starts.tolist()
+        ends_l = ends.tolist()
+
+        tensors: list = []
+        inputs: list = []
+        for s, e in zip(starts_l, ends_l):
+            m = e - s
+            card_pairs = tuple(pairs[s : e - 1])
+            tensors.extend(full[s : s + j] for j in range(m))
+            inputs.extend(card_pairs[:j] for j in range(m))
+
+        cast(Any, df)["tensor"] = tensors
+        cast(Any, df)["inputs"] = inputs
 
         return df
