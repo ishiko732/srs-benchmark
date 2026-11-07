@@ -98,6 +98,12 @@ def create_parser():
         help="directory of the global boosters for --xgboost global (global_boosters_meta.json + fold_*.ubj); trained there first when it has none",
     )
     parser.add_argument(
+        "--xgboost_neutralize",
+        choices=["user_recall", "user_ewma"],
+        default=None,
+        help="FSRS-XGBoost ablation: hold a named feature set at 0 in training and prediction (user_recall: the three user recall EWMAs; user_ewma: also the two FSRS-error EWMAs). Adds -nz_<set> to the result name. (default: off)",
+    )
+    parser.add_argument(
         "--xgboost_anchors",
         type=int,
         default=300,
@@ -255,6 +261,9 @@ class Config:
         if self.xgboost in ("global", "global-split") and not self.xgboost_boosters:
             raise ValueError(f"--xgboost {self.xgboost} requires --xgboost_boosters")
         self.xgboost_anchors: int = args.xgboost_anchors
+        self.xgboost_neutralize: str | None = args.xgboost_neutralize
+        if self.xgboost_neutralize and not self.xgboost:
+            raise ValueError("--xgboost_neutralize requires --xgboost")
         if self.xgboost in ("global", "global-split"):
             # Fail before any user runs if existing boosters belong to another model/prior.
             from models.fsrs_xgboost import check_global_meta, read_global_meta
@@ -332,6 +341,8 @@ class Config:
             _file_name_parts.append("-xgboost_global")
         elif self.xgboost == "global-split":
             _file_name_parts.append("-xgboost_global_split")
+        if self.xgboost and self.xgboost_neutralize:
+            _file_name_parts.append(f"-nz_{self.xgboost_neutralize}")
         if self.two_buttons:
             # Suffix is '-binary' for backward compatibility with existing analysis scripts.
             _file_name_parts.append("-binary")

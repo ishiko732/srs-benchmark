@@ -102,6 +102,24 @@ FEATURE_NAMES: tuple[str, ...] = (
     "user_mode_ewma_fsrs_err_100",
 )
 
+# --xgboost_neutralize: named feature sets held at a constant 0 in training and prediction,
+# so no tree can split on them (ablation without changing the 36-column layout).
+NEUTRALIZE_SETS: dict[str, tuple[str, ...]] = {
+    "user_recall": ("user_ewma_recall_20", "user_ewma_recall_200", "user_mode_ewma_recall_50"),
+    "user_ewma": (
+        "user_ewma_recall_20",
+        "user_ewma_recall_200",
+        "user_mode_ewma_recall_50",
+        "user_ewma_fsrs_err_50",
+        "user_mode_ewma_fsrs_err_100",
+    ),
+}
+
+
+def neutralized_features(config: Config) -> tuple[str, ...]:
+    name = getattr(config, "xgboost_neutralize", None)
+    return NEUTRALIZE_SETS[name] if name else ()
+
 
 def clip_prob(p: np.ndarray, eps: float = PROB_EPS) -> np.ndarray:
     return np.clip(np.asarray(p, dtype=np.float64), eps, 1.0 - eps)
@@ -556,8 +574,10 @@ def build_feature_matrix(
     default_logit_p: np.ndarray,
     ewma_fsrs_err_50: np.ndarray,
     mode_ewma_fsrs_err_100: np.ndarray,
+    neutralize: tuple[str, ...] = (),
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Assemble the [N, 36] float32 feature matrix X and float32 base_margin = logit(p_fsrs)."""
+    """Assemble the [N, 36] float32 feature matrix X and float32 base_margin = logit(p_fsrs);
+    `neutralize` columns are set to 0."""
     log_sl = np.log(np.maximum(base_states.s_long, 0.0) + TIME_EPS)
     log_ss = np.log(np.maximum(base_states.s_short, 0.0) + TIME_EPS)
     log_dt = static.log_delta_t[row_pos]
@@ -610,6 +630,8 @@ def build_feature_matrix(
         )
 
     X = np.column_stack(cols).astype(np.float32, copy=False)
+    if neutralize:
+        X[:, [FEATURE_NAMES.index(n) for n in neutralize]] = 0.0
     base_margin = base_states.logit_p.astype(np.float32, copy=False)
     return X, base_margin
 
@@ -971,6 +993,12 @@ def check_global_meta(meta: dict[str, Any], config: Config) -> None:
             f"boosters were trained for {scope} {base_model} ({meta.get('priorMode')} prior), "
             f"not {config.xgboost} {config.model_name} ({prior} prior)"
         )
+    trained_nz = list(meta.get("neutralizedFeatures", []))
+    if trained_nz != list(neutralized_features(config)):
+        raise ValueError(
+            f"boosters were trained with neutralized features {trained_nz}, "
+            f"not {list(neutralized_features(config))} (--xgboost_neutralize)"
+        )
 
 
 def load_global_boosters(
@@ -1140,6 +1168,7 @@ def _walk_folds(
                 default_states.logit_p[train_pos],
                 ewma_50[:n_train],
                 mode_ewma_100[:n_train],
+                neutralize=neutralized_features(config),
             )
             X_test, m_test = build_feature_matrix(
                 static,
@@ -1148,6 +1177,7 @@ def _walk_folds(
                 default_states.logit_p[test_pos],
                 ewma_50[n_train:],
                 mode_ewma_100[n_train:],
+                neutralize=neutralized_features(config),
             )
             yield _Fold(
                 split_i=split_i,
@@ -1269,6 +1299,7 @@ def _save_user_booster(
         "bestTrees": fitted.best_ntree,
         "modelFile": model_file,
         "features": list(FEATURE_NAMES),
+        "neutralizedFeatures": list(neutralized_features(config)),
     }
     (out_dir / f"{stem}.json").write_text(json.dumps(meta) + "\n", encoding="utf-8")
 
@@ -1367,6 +1398,7 @@ def train_global_boosters(
         "priorMode": "default" if config.default_params else "trained",
         "xgboostVersion": xgb.__version__,
         "anchorUserIds": sorted(per_user),
+        "neutralizedFeatures": list(neutralized_features(config)),
         "folds": folds,
     }
     (out_dir / GLOBAL_META_FILE).write_text(
